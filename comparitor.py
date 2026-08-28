@@ -141,7 +141,7 @@ def comparison_counts(excerpt_ids, comparisons):
     return counts, seen_pairs
 
 
-def fit_scores(excerpt_ids, comparisons):
+def fit_scores(excerpt_ids, comparisons, warm_start=None):
     # Extract the comparisions list into numpy arrays
     excerpts_to_i = {id: i for i, id in enumerate(excerpt_ids)}
     a = np.array([excerpts_to_i[c["a"]] for c in comparisons])
@@ -149,7 +149,7 @@ def fit_scores(excerpt_ids, comparisons):
 
     points = {"a": 1, "b": 0, "tie": 0.5}
     wa = np.array([points[c["result"]] for c in comparisons])
-    wb  = 1 - wa
+    wb = 1 - wa
 
     # Add one fictitious game as an anchor: every excerpt draws with the anchor.
     # The anchor does two things: it avoids zeros in the numerator when computing
@@ -162,7 +162,7 @@ def fit_scores(excerpt_ids, comparisons):
     wb = np.concatenate([wb, np.full(n, 0.5)])
 
     # Initialise ps as unity to begin with and then perform fitting
-    p_next = np.ones(n + 1)
+    p_next = np.ones(n + 1) if warm_start is None else np.append(warm_start, 1.0)
     for iter in range(1000):
         p = p_next
 
@@ -170,13 +170,11 @@ def fit_scores(excerpt_ids, comparisons):
         p[-1] = 1
 
         d = 1 / (p[a] + p[b])
-        numerator = (
-            np.bincount(a, weights=wa * p[b] * d, minlength=n + 1) +
-            np.bincount(b, weights=wb * p[a] * d, minlength=n + 1)
-        )
-        denominator = (
-            np.bincount(a, weights=wb * d, minlength=n + 1) +
-            np.bincount(b, weights=wa * d, minlength=n + 1)
+        numerator = np.bincount(
+            a, weights=wa * p[b] * d, minlength=n + 1
+        ) + np.bincount(b, weights=wb * p[a] * d, minlength=n + 1)
+        denominator = np.bincount(a, weights=wb * d, minlength=n + 1) + np.bincount(
+            b, weights=wa * d, minlength=n + 1
         )
 
         # Use a damping factor to set p_next
@@ -185,12 +183,14 @@ def fit_scores(excerpt_ids, comparisons):
 
         # Break early if we have converged
         if np.abs(np.log(p) - np.log(p_next)).max() < 1e-6:
-            print(f"Bradley-Terry fitting breaking early due to convergence (iter={iter})")
+            print(
+                f"Bradley-Terry fitting breaking early due to convergence (iter={iter})"
+            )
             break
     else:
         print("Bradley-Terry fitting did not converge early")
 
-    return  dict(zip(excerpt_ids, p_next))
+    return dict(zip(excerpt_ids, p_next))
 
 
 def aggregate_to_sources(excerpts, excerpt_scores):
@@ -219,7 +219,9 @@ def reliability(excerpt_ids, comparisons, pi=None):
     for c in comparisons:
         i, j = c["a"], c["b"]
         p_ij = pi[i] / (pi[i] + pi[j])
-        fisher = p_ij * (1 - p_ij)  # information one comparison carries about theta_i - theta_j
+        fisher = p_ij * (
+            1 - p_ij
+        )  # information one comparison carries about theta_i - theta_j
         info[i] += fisher
         info[j] += fisher
 
@@ -234,63 +236,104 @@ def reliability(excerpt_ids, comparisons, pi=None):
     return max(0.0, 1.0 - mean_error_var / observed_var) if observed_var > 0 else 0.0
 
 
-def pick_pairs(excerpt_ids, scores, counts, seen_pairs, k):
+def _bootstrap_replicate(excerpt_ids, comparisons, base_pi, rng):
+    m = len(comparisons)
+    sample = [comparisons[i] for i in rng.integers(0, m, size=m)]
+    pi_b = fit_scores(excerpt_ids, sample, warm_start=base_pi)
+    return np.log(list(pi_b.values()))
+
+
+def bootstrap_errors(excerpt_ids, comparisons, n_boot):
+    """
+    Empirical per-item error via bootstrap, with replicates run concurrently.
+    fit_scores is numpy-bound (bincount, elementwise array arithmetic), and
+    numpy releases the GIL during those C-level operations, so threads can
+    genuinely overlap here rather than just serializing behind the GIL the
+    way pure-Python-bound work would. Each replicate gets its own
+    independent RNG stream (SeedSequence.spawn), since sharing one RNG
+    object across threads is not safe to call concurrently.
+    """
+    rng = np.random.default_rng()
+    m = len(comparisons)
+    base_pi = np.array(
+        list(fit_scores(excerpt_ids, comparisons).values())
+    )       # warm-start reference
+    thetas = np.empty((n_boot, len(excerpt_ids)))
+    for b in range(n_boot):
+        sample = [comparisons[i] for i in rng.integers(0, m, size=m)]
+        pi_b = list(fit_scores(excerpt_ids, sample, warm_start=base_pi).values())
+        thetas[b] = np.log(pi_b)
+
+    return thetas.std(axis=0)
+
+
+def bootstrap_summary(excerpt_ids, comparisons, n_boot=15):
+    errors = bootstrap_errors(excerpt_ids, comparisons, n_boot)
+    return {
+        "median_error": float(np.median(errors)),
+        "p90_error": float(np.percentile(errors, 90)),
+        "p95_error": float(np.percentile(errors, 95)),
+        "per_item": dict(zip(excerpt_ids, errors)),
+    }
+
+
+def pick_pairs(
+    excerpt_ids, scores, counts, seen_pairs, k, window_sigma=4.0, max_attempts=8
+):
     """
     Select up to k adaptive pairs. Each excerpt is drawn without replacement
     with probability weighted toward low comparison counts (Efraimidis-
-    Spirakis weighted sampling -- a single vectorized argsort, not a loop),
-    so independent parallel workers land on genuinely different items even
-    within a large tied-on-count group, rather than all agreeing on the
-    same deterministic front-runners. Each drawn item is then matched to
-    its nearest available score-neighbor, preferring one that is both
-    unseen and itself under-compared.
+    Spirakis sampling -- one vectorized argsort, not a loop). Each drawn
+    item is matched to a partner sampled from a Gaussian-weighted window
+    of nearby score-ranks (a batch of offsets drawn up front, one row per
+    priority slot), retrying nearby offsets until an unseen pair turns up
+    or the attempts run out -- so a mostly-local match is still the common
+    case, but an item is never forced into repeating an already-seen
+    comparison just because its single nearest neighbor is exhausted.
     """
     n = len(excerpt_ids)
     idx = {e: i for i, e in enumerate(excerpt_ids)}
     score = np.array([scores.get(e, 1.0) for e in excerpt_ids])
     count = np.array([counts.get(e, 0) for e in excerpt_ids])
-    log_score = np.log(score)
     seen_idx = {frozenset((idx[a], idx[b])) for a, b in seen_pairs}
 
-    id_at = np.argsort(score)        # position -> excerpt index, sorted by score
-    pos_of = np.argsort(id_at)       # excerpt index -> position (inverse permutation)
+    id_at = np.argsort(score)  # position -> excerpt index, sorted by score
+    pos_of = np.argsort(id_at)  # excerpt index -> position
+    removed = np.zeros(n, dtype=bool)
 
-    prev = list(range(-1, n - 1))
-    nxt = list(range(1, n + 1))
-    nxt[n - 1] = -1
-    removed = [False] * n
-
-    def remove(pos):
-        removed[pos] = True
-        p, q = prev[pos], nxt[pos]
-        if p != -1: nxt[p] = q
-        if q != -1: prev[q] = p
-
-    # weighted sampling without replacement, weight ~ 1/(count+1)^2:
-    # draw one key per excerpt, take the largest k -- equivalent to
-    # sampling proportional to weight, but a single vectorized argsort
-    weight = 1.0 / (count + 1) ** 2
+    weight = 1.0 / (count + 1) ** 4
     keys = np.random.random(n) ** (1.0 / weight)
     priority = np.argsort(-keys)
 
+    offsets = np.round(
+        np.random.normal(0, window_sigma, size=(n, max_attempts))
+    ).astype(int)
+    offsets[offsets == 0] = np.random.choice([-1, 1])  # never "pair with yourself"
+
     pairs = []
-    for e in priority.tolist():
+    for row, e in enumerate(priority.tolist()):
         if len(pairs) >= k:
             break
         p = pos_of[e]
         if removed[p]:
             continue
-        remove(p)
-        candidates = [c for c in (prev[p], nxt[p]) if c != -1]
-        if not candidates:
+        removed[p] = True
+
+        partner_pos, fallback_pos = None, None
+        for offset in offsets[row]:
+            target = p + offset
+            if target < 0 or target >= n or removed[target]:
+                continue
+            if fallback_pos is None:
+                fallback_pos = target
+            if frozenset((e, id_at[target])) not in seen_idx:
+                partner_pos = target
+                break
+
+        partner_pos = partner_pos if partner_pos is not None else fallback_pos
+        if partner_pos is None:
             continue
-        candidates.sort(key=lambda c: (
-            frozenset((e, id_at[c])) in seen_idx,
-            count[id_at[c]],
-            abs(log_score[id_at[c]] - log_score[e]),
-        ))
-        partner_pos = candidates[0]
-        remove(partner_pos)
+        removed[partner_pos] = True
         pairs.append((excerpt_ids[e], excerpt_ids[id_at[partner_pos]]))
 
     random.shuffle(pairs)
@@ -379,8 +422,14 @@ def run_compare(args):
             if not round_pairs:
                 comparisons = load_comparisons(log_path)
                 counts, seen_pairs = comparison_counts(excerpt_ids, comparisons)
-                scores = fit_scores(excerpt_ids, comparisons) if comparisons else {e: 1.0 for e in excerpt_ids}
-                round_pairs = pick_pairs(excerpt_ids, scores, counts, seen_pairs, k=REFRESH_EVERY)
+                scores = (
+                    fit_scores(excerpt_ids, comparisons)
+                    if comparisons
+                    else {e: 1.0 for e in excerpt_ids}
+                )
+                round_pairs = pick_pairs(
+                    excerpt_ids, scores, counts, seen_pairs, k=REFRESH_EVERY
+                )
                 if not round_pairs:
                     print("No further pairs available.")
                     break
@@ -442,8 +491,7 @@ def run_scores(args):
     if len(source_scores) > 250:
         stride = len(source_scores) // 250
         sorted_scores = sorted(
-            list(source_scores.items())[::stride],
-            key=lambda kv: -kv[1]
+            list(source_scores.items())[::stride], key=lambda kv: -kv[1]
         )
     else:
         sorted_scores = sorted(source_scores.items(), key=lambda kv: -kv[1])
@@ -465,10 +513,22 @@ def run_scores(args):
         n_comps[c["a"]] = n_comps.get(c["a"], 0) + 1
         n_comps[c["b"]] = n_comps.get(c["b"], 0) + 1
 
-    print(f"\nExcerpt comparisons (min|median|max|total): {min(n_comps.values())} | {np.median(list(n_comps.values()))} | {max(n_comps.values())} | {sum(n_comps.values())}/{len(n_comps)} (x{sum(n_comps.values())/len(n_comps):.1f})")
+    print(
+        f"\nExcerpt comparisons (min|median|max|total): {min(n_comps.values())} | {np.median(list(n_comps.values()))} | {max(n_comps.values())} | {len(comparisons)}/{len(excerpts)} (x{len(comparisons) / len(excerpts):.1f})"
+    )
 
-    print(f"\nScale separation reliability: {reliability(excerpt_ids, comparisons, pi=excerpt_scores):.2f} "
-      "(rule of thumb: >0.7 reliable, >0.9 diminishing returns)")
+    print(np.bincount(list(n_comps.values())))
+
+    print(
+        f"\nScale separation reliability: {reliability(excerpt_ids, comparisons, pi=excerpt_scores):.2f} "
+        "(rule of thumb: >0.7 reliable, >0.9 diminishing returns)"
+    )
+
+    summary = bootstrap_summary(excerpt_ids, comparisons, n_boot=15)
+    print(
+        f"95% of items have error below {summary['p95_error']:.2f} (log-strength units); "
+        f"median error {summary['median_error']:.2f}"
+    )
 
 
 def run_reset(args):
