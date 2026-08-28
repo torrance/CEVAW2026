@@ -4,19 +4,21 @@ hansard_emotional_rank.py
 
 Adaptive pairwise comparison tool for rating how "emotional" short text
 excerpts are. Supports a human rater (typed at the terminal) or a local
-Ollama model as the rater, using the same adaptive sampling and scoring
+vLLM model as the rater, using the same adaptive sampling and scoring
 logic either way -- so swapping human for LLM is just a flag.
 
 Usage:
     # human rater (default) -- runs until you quit (q) or Ctrl-C
     python hansard_emotional_rank.py compare corpus.json
 
-    # LLM rater, via a local Ollama server -- runs indefinitely; Ctrl-C is
-    # safe at any point, since each comparison is flushed to disk as it's made
+    # LLM rater, via a local vLLM model (offline batch inference) -- runs
+    # indefinitely; Ctrl-C is safe at any point, since each comparison is
+    # flushed to disk as it's made
     python hansard_emotional_rank.py compare corpus.json \
         --rater llm \
         --prompt "Decide which excerpt expresses more emotion." \
-        --llm-model gemma4:31b-it-q8_0
+        --llm-model google/gemma-4-E4B-it \
+        --nbatch 500
 
     python hansard_emotional_rank.py scores corpus.json
     python hansard_emotional_rank.py reset  corpus.json
@@ -41,17 +43,16 @@ import random
 import re
 import textwrap
 import time
-import urllib.request
 from collections import Counter
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from vllm import LLM
 
 
 SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 VIRTUAL_ANCHOR = "__anchor__"  # fixed reference point used to regularise the fit
-REFRESH_EVERY = 500
 
 WINNER_TO_RESULT = {"A": "a", "B": "b", "TIE": "tie"}
 
@@ -257,7 +258,7 @@ def bootstrap_errors(excerpt_ids, comparisons, n_boot):
     m = len(comparisons)
     base_pi = np.array(
         list(fit_scores(excerpt_ids, comparisons).values())
-    )       # warm-start reference
+    )  # warm-start reference
     thetas = np.empty((n_boot, len(excerpt_ids)))
     for b in range(n_boot):
         sample = [comparisons[i] for i in rng.integers(0, m, size=m)]
@@ -359,26 +360,6 @@ def build_llm_prompt(prompt, text_a, text_b):
     return f"{prompt}\n\nTEXT A\n\n{text_a}\n\nTEXT B\n\n{text_b}"
 
 
-def call_ollama(prompt, model, host, timeout=120):
-    body = json.dumps(
-        {
-            "model": model,
-            "prompt": prompt,
-            "think": False,
-            "stream": False,
-        }
-    ).encode("utf-8")
-    req = urllib.request.Request(
-        f"{host}/api/generate", data=body, headers={"Content-Type": "application/json"}
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        response = json.loads(resp.read())
-        print(response["response"])
-        print(response["prompt_eval_count"])
-        print(response.get("thinking", "NO THINKING"))
-        return response["response"]
-
-
 def parse_llm_response(raw):
     """Parse the model's JSON reply, tolerating minor wrapping around the object."""
     try:
@@ -390,17 +371,31 @@ def parse_llm_response(raw):
         return json.loads(match.group(0))
 
 
-def ask_llm(text_a, text_b, prompt, model, host):
-    """Ask a local Ollama model to judge a pair; returns (result, reason, error_flag)."""
-    full_prompt = build_llm_prompt(prompt, text_a, text_b)
-    try:
-        parsed = parse_llm_response(call_ollama(full_prompt, model, host))
-        winner = str(parsed.get("winner", "")).strip().upper()
-        result = WINNER_TO_RESULT.get(winner)
-        error = bool(int(parsed.get("error", 0))) or result is None
-        return result, str(parsed.get("reason", "")), int(error)
-    except Exception as exc:
-        return None, f"request failed: {exc}", 1
+def ask_llm_batch(pairs, text_by_id, prompt, llm, sampling_params):
+    """Ask the LLM to judge a whole batch of pairs in a single vLLM call;
+    returns a (result, reason, error_flag) tuple per pair, same order."""
+    messages = [
+        [
+            {
+                "role": "user",
+                "content": build_llm_prompt(prompt, text_by_id[a], text_by_id[b]),
+            }
+        ]
+        for a, b in pairs
+    ]
+    outputs = llm.chat(messages, sampling_params=sampling_params)
+
+    results = []
+    for output in outputs:
+        try:
+            parsed = parse_llm_response(output.outputs[0].text)
+            winner = str(parsed.get("winner", "")).strip().upper()
+            result = WINNER_TO_RESULT.get(winner)
+            error = bool(int(parsed.get("error", 0))) or result is None
+            results.append((result, str(parsed.get("reason", "")), int(error)))
+        except Exception as exc:
+            results.append((None, f"request failed: {exc}", 1))
+    return results
 
 
 def run_compare(args):
@@ -415,6 +410,15 @@ def run_compare(args):
     else:
         prompt = ""
 
+    if args.rater == "llm":
+        llm = LLM(model=args.llm_model, generation_config="auto")
+        sampling_params = llm.get_default_sampling_params()
+        sampling_params.max_tokens = (
+            1024  # room for a ~2000-char reason plus JSON overhead
+        )
+    else:
+        llm, sampling_params = None, None
+
     done, consecutive_errors = 0, 0
     round_pairs = []
     try:
@@ -428,38 +432,48 @@ def run_compare(args):
                     else {e: 1.0 for e in excerpt_ids}
                 )
                 round_pairs = pick_pairs(
-                    excerpt_ids, scores, counts, seen_pairs, k=REFRESH_EVERY
+                    excerpt_ids, scores, counts, seen_pairs, k=args.nbatch
                 )
                 if not round_pairs:
                     print("No further pairs available.")
                     break
+
+            if args.rater == "llm":
+                batch = [
+                    (b, a) if random.random() < 0.5 else (a, b) for a, b in round_pairs
+                ]  # avoid a systematic left/right or A/B bias
+                round_pairs = []
+                for (a, b), (result, reason, error) in zip(
+                    batch,
+                    ask_llm_batch(batch, text_by_id, prompt, llm, sampling_params),
+                ):
+                    if error or result is None:
+                        consecutive_errors += 1
+                        print(
+                            f"[llm error, {consecutive_errors}/{args.max_errors}] {reason}"
+                        )
+                        if consecutive_errors >= args.max_errors:
+                            print("Too many consecutive LLM errors -- aborting.")
+                            return
+                        continue
+                    consecutive_errors = 0
+                    print(f"{a} vs {b}: {result.upper()} -- {reason}")
+                    append_comparison(
+                        log_path, a, b, result, rater=args.rater, reason=reason
+                    )
+                    done += 1
+                continue
 
             a, b = round_pairs.pop()
             if random.random() < 0.5:  # avoid a systematic left/right or A/B bias
                 a, b = b, a
             text_a, text_b = text_by_id[a], text_by_id[b]
 
-            if args.rater == "llm":
-                result, reason, error = ask_llm(
-                    text_a, text_b, prompt, args.llm_model, args.llm_host
-                )
-                if error or result is None:
-                    consecutive_errors += 1
-                    print(
-                        f"[llm error, {consecutive_errors}/{args.max_errors}] {reason}"
-                    )
-                    if consecutive_errors >= args.max_errors:
-                        print("Too many consecutive LLM errors -- aborting.")
-                        return
-                    continue
-                consecutive_errors = 0
-                print(f"{a} vs {b}: {result.upper()} -- {reason}")
-            else:
-                choice = ask_human(text_a, text_b)
-                if choice == "q":
-                    print(f"Stopped after {done} comparisons this session.")
-                    return
-                result, reason = {"1": "a", "2": "b", "e": "tie"}[choice], ""
+            choice = ask_human(text_a, text_b)
+            if choice == "q":
+                print(f"Stopped after {done} comparisons this session.")
+                return
+            result, reason = {"1": "a", "2": "b", "e": "tie"}[choice], ""
 
             append_comparison(log_path, a, b, result, rater=args.rater, reason=reason)
             done += 1
@@ -559,9 +573,16 @@ def main():
         "--prompt",
         help="file containing the prompt given to the LLM rater (ignored for --rater human)",
     )
-    p.add_argument("--llm-model", default="gemma4:31b-it-q8_0", help="Ollama model tag")
     p.add_argument(
-        "--llm-host", default="http://localhost:11434", help="Ollama server URL"
+        "--llm-model",
+        default="google/gemma-4-E4B-it",
+        help="vLLM model name (Hugging Face repo id) or local path",
+    )
+    p.add_argument(
+        "--nbatch",
+        type=int,
+        default=500,
+        help="prompts per vLLM batch call (also sets the adaptive-pairing refresh size)",
     )
     p.add_argument(
         "--max-errors",
