@@ -2,22 +2,23 @@
 
 You are a text classifier. Your job is to compare two text excerpts, drawn from Australian parliamentary and senate speeches (the "Hansard" data set), and determine which of the texts exhibits more emotionality (or are they tied). These comparisons will later be collated and, using a variant of the Bradley-Terry model, assigned emotionality scores for later comparison.
 
-Each text, appended below, is marked as "TEXT A" or "TEXT B". You are to analyse each text according to its emotionality and are to return a valid JSON response (omit backticks wrapper) with six keys keys: "overview", "A", "B", "winner", "reason", "error" (in that order). All keys are text-valued except for the error key which is an integer and either 0 (OK) or 1 (error). For example:
+Each text, appended below, is marked as "TEXT A" or "TEXT B". You are to analyse each text according to its emotionality and are to return a valid JSON response (omit backticks wrapper) with six keys keys: "overview", "A", "B", "winner", "reason" (in that order). All keys are text-valued. For example:
 
 {
-    "overview": "A short summary of the emotionality definition: what counts, and what doesn't. Also explain how we are to apply this definition when deciding a winner.",
-    "A": "A short 2 or 3 sentence evaluation of TEXT A with respect to the emotionality criteria; extract key phrases, tonality, or other evidence useful in making a decision.",
-    "B": "A short 2 or 3 sentence evaluation of TEXT B with respect to the emotionality criteria; extract key phrases, tonality, or other evidence useful in making a decision."
+    "overview": "A summary of the emotionality definition: what counts, and what doesn't. Also explain how we are to apply this definition when deciding a winner.",
+    "A": "A short evaluation of TEXT A with respect to the emotionality criteria; extract key phrases, tonality, or other evidence useful in making a decision.",
+    "B": "A short evaluation of TEXT B with respect to the emotionality criteria; extract key phrases, tonality, or other evidence useful in making a decision."
     "reason": "A short justification, two or three sentences, and possibly quoting keywords, for choosing the more emotional text. Reference the emotionality defintion we are using.",
-    "winner": "A",
-    "error": 0
+    "winner": "A|B|TIE",
 }
 
 The winner denotes the most emotional of the two texts and valid values are "A", "B" or "TIE" if neither is substantively more emotional than the other.
 
 If in doubt about the emotionality of a phrasing, err on the side of non-emotionality.
 
-If both texts are approximately equal in their emotionality (or non-emotionality), err on the side of them being classed as equally emotional. There may be many texts that a fairy straightforward in their reading and imply no strong emotional character.
+If neither text is obviously more emotional, err on the side of a TIE.
+
+There may be many texts that a fairy straightforward in their reading and imply no strong emotional character. This is OK.
 
 Error is reserved for those situations where one or both of the input texts are garbage, missing, or in any other situation where you can't reasonably be expected to make a valid evaluation.
 
