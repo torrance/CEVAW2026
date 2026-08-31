@@ -41,6 +41,7 @@ import json
 import math
 import random
 import re
+import pickle
 import textwrap
 import time
 from collections import Counter
@@ -142,7 +143,7 @@ def comparison_counts(excerpt_ids, comparisons):
     return counts, seen_pairs
 
 
-def fit_scores(excerpt_ids, comparisons, warm_start=None):
+def fit_scores(excerpt_ids, comparisons, warm_start=None, tolerance=1e-3):
     # Extract the comparisions list into numpy arrays
     excerpts_to_i = {id: i for i, id in enumerate(excerpt_ids)}
     a = np.array([excerpts_to_i[c["a"]] for c in comparisons])
@@ -179,17 +180,18 @@ def fit_scores(excerpt_ids, comparisons, warm_start=None):
         )
 
         # Use a damping factor to set p_next
-        alpha = 0.5
-        p_next = alpha * p + (1 - alpha) * (numerator / denominator)
+        alpha = 0.2
+        p_next = (1 - alpha) * p + alpha * (numerator / denominator)
 
         # Break early if we have converged
-        if np.abs(np.log(p) - np.log(p_next)).max() < 1e-6:
+        maxdelta = np.abs(np.log(p) - np.log(p_next)).max()
+        if maxdelta < tolerance:
             print(
                 f"Bradley-Terry fitting breaking early due to convergence (iter={iter})"
             )
             break
     else:
-        print("Bradley-Terry fitting did not converge early")
+        print(f"Bradley-Terry fitting did not converge early (max delta = {maxdelta})")
 
     return dict(zip(excerpt_ids, p_next))
 
@@ -262,7 +264,7 @@ def bootstrap_errors(excerpt_ids, comparisons, n_boot):
     thetas = np.empty((n_boot, len(excerpt_ids)))
     for b in range(n_boot):
         sample = [comparisons[i] for i in rng.integers(0, m, size=m)]
-        pi_b = list(fit_scores(excerpt_ids, sample, warm_start=base_pi).values())
+        pi_b = list(fit_scores(excerpt_ids, sample, warm_start=base_pi, tolerance=5e-2).values())
         thetas[b] = np.log(pi_b)
 
     return thetas.std(axis=0)
@@ -497,6 +499,10 @@ def run_scores(args):
     excerpt_scores = fit_scores(excerpt_ids, comparisons)
     print("Done.")
     source_scores = aggregate_to_sources(excerpts, excerpt_scores)
+
+    filename = Path(args.corpus).with_suffix("").with_suffix(".scores.pkl")
+    with open(filename, "wb") as f:
+        pickle.dump(source_scores, f)
 
     n_excerpts = {}
     for e in excerpts:
