@@ -61,7 +61,6 @@ WINNER_TO_RESULT = {"A": "a", "B": "b", "TIE": "tie"}
 def load_corpus(path):
     """Load a list of {"id", "text"} dicts from a JSON or CSV file."""
     df = pd.read_parquet(path)
-    df = df.query("`interject` == '0' and `body`.str.len() > 500")[1::10]
     print(f"Loaded {len(df)} rows of text")
     return [{"id": row.Index, "text": row.body} for row in df.itertuples()]
 
@@ -71,11 +70,13 @@ def split_sentences(text):
 
 
 def chunk_sentences(sentences, target=6):
-    """Split sentences into excerpts of ~5-6 sentences, as evenly as possible."""
+    """Split sentences into excerpts as evenly as possible.
+    If chunking occurs at all, every resulting chunk has at least `target`
+    sentences."""
     n = len(sentences)
-    if n <= target:
+    if n <= 2 * target:
         return [sentences] if sentences else []
-    num_chunks = max(1, round(n / (target - 0.5)))
+    num_chunks = min(max(1, round(n / (target - 0.5))), n // target)
     base, extra = divmod(n, num_chunks)
     chunks, i = [], 0
     for k in range(num_chunks):
@@ -135,12 +136,10 @@ def append_comparison(log_path, a, b, result, rater="human", reason=""):
 
 def comparison_counts(excerpt_ids, comparisons):
     counts = {e: 0 for e in excerpt_ids}
-    seen_pairs = set()
     for c in comparisons:
         counts[c["a"]] = counts.get(c["a"], 0) + 1
         counts[c["b"]] = counts.get(c["b"], 0) + 1
-        seen_pairs.add(frozenset((c["a"], c["b"])))
-    return counts, seen_pairs
+    return counts
 
 
 def fit_scores(excerpt_ids, comparisons, warm_start=None, tolerance=1e-3):
@@ -264,7 +263,9 @@ def bootstrap_errors(excerpt_ids, comparisons, n_boot):
     thetas = np.empty((n_boot, len(excerpt_ids)))
     for b in range(n_boot):
         sample = [comparisons[i] for i in rng.integers(0, m, size=m)]
-        pi_b = list(fit_scores(excerpt_ids, sample, warm_start=base_pi, tolerance=5e-2).values())
+        pi_b = list(
+            fit_scores(excerpt_ids, sample, warm_start=base_pi, tolerance=5e-2).values()
+        )
         thetas[b] = np.log(pi_b)
 
     return thetas.std(axis=0)
@@ -280,67 +281,29 @@ def bootstrap_summary(excerpt_ids, comparisons, n_boot=15):
     }
 
 
-def pick_pairs(
-    excerpt_ids, scores, counts, seen_pairs, k, window_sigma=4.0, max_attempts=8
-):
+def pick_pairs(excerpt_ids, counts, k):
     """
-    Select up to k adaptive pairs. Each excerpt is drawn without replacement
-    with probability weighted toward low comparison counts (Efraimidis-
-    Spirakis sampling -- one vectorized argsort, not a loop). Each drawn
-    item is matched to a partner sampled from a Gaussian-weighted window
-    of nearby score-ranks (a batch of offsets drawn up front, one row per
-    priority slot), retrying nearby offsets until an unseen pair turns up
-    or the attempts run out -- so a mostly-local match is still the common
-    case, but an item is never forced into repeating an already-seen
-    comparison just because its single nearest neighbor is exhausted.
+    Select up to k pairs with no locality constraint at all: draw the top
+    2k excerpts by the same low-count-weighted priority pick_pairs uses,
+    then pair them up in a random order among themselves regardless of
+    score. Doesn't check seen_pairs -- with 2k items drawn from the full
+    corpus the odds of blindly re-pairing an already-seen comparison are
+    low, and avoiding that would need the same score-neighbor machinery
+    this is deliberately skipping.
     """
-    n = len(excerpt_ids)
-    idx = {e: i for i, e in enumerate(excerpt_ids)}
-    score = np.array([scores.get(e, 1.0) for e in excerpt_ids])
     count = np.array([counts.get(e, 0) for e in excerpt_ids])
-    seen_idx = {frozenset((idx[a], idx[b])) for a, b in seen_pairs}
 
-    id_at = np.argsort(score)  # position -> excerpt index, sorted by score
-    pos_of = np.argsort(id_at)  # excerpt index -> position
-    removed = np.zeros(n, dtype=bool)
-
+    # Efraimidis-Spirakis weighted sampling without replacement: orders
+    # excerpts favoring low comparison counts
     weight = 1.0 / (count + 1) ** 4
-    keys = np.random.random(n) ** (1.0 / weight)
-    priority = np.argsort(-keys)
+    keys = np.random.random(len(count)) ** (1.0 / weight)
+    top = np.argsort(-keys)[: 2 * k]
 
-    offsets = np.round(
-        np.random.normal(0, window_sigma, size=(n, max_attempts))
-    ).astype(int)
-    offsets[offsets == 0] = np.random.choice([-1, 1])  # never "pair with yourself"
-
-    pairs = []
-    for row, e in enumerate(priority.tolist()):
-        if len(pairs) >= k:
-            break
-        p = pos_of[e]
-        if removed[p]:
-            continue
-        removed[p] = True
-
-        partner_pos, fallback_pos = None, None
-        for offset in offsets[row]:
-            target = p + offset
-            if target < 0 or target >= n or removed[target]:
-                continue
-            if fallback_pos is None:
-                fallback_pos = target
-            if frozenset((e, id_at[target])) not in seen_idx:
-                partner_pos = target
-                break
-
-        partner_pos = partner_pos if partner_pos is not None else fallback_pos
-        if partner_pos is None:
-            continue
-        removed[partner_pos] = True
-        pairs.append((excerpt_ids[e], excerpt_ids[id_at[partner_pos]]))
-
-    random.shuffle(pairs)
-    return pairs
+    np.random.shuffle(top)
+    return [
+        (excerpt_ids[top[i]], excerpt_ids[top[i + 1]])
+        for i in range(0, len(top) - 1, 2)
+    ]
 
 
 def ask_human(text_a, text_b, width=90):
@@ -385,7 +348,11 @@ def ask_llm_batch(pairs, text_by_id, prompt, llm, sampling_params):
         ]
         for a, b in pairs
     ]
-    outputs = llm.chat(messages, sampling_params=sampling_params)
+    outputs = llm.chat(
+        messages,
+        sampling_params=sampling_params,
+        chat_template_kwargs={"enable_thinking": False},
+    )
 
     results = []
     for output in outputs:
@@ -393,10 +360,9 @@ def ask_llm_batch(pairs, text_by_id, prompt, llm, sampling_params):
             parsed = parse_llm_response(output.outputs[0].text)
             winner = str(parsed.get("winner", "")).strip().upper()
             result = WINNER_TO_RESULT.get(winner)
-            error = bool(int(parsed.get("error", 0))) or result is None
-            results.append((result, str(parsed.get("reason", "")), int(error)))
+            results.append((result, parsed.get("reason", "")))
         except Exception as exc:
-            results.append((None, f"request failed: {exc}", 1))
+            results.append((None, f"request failed: {exc}"))
     return results
 
 
@@ -427,15 +393,8 @@ def run_compare(args):
         while True:
             if not round_pairs:
                 comparisons = load_comparisons(log_path)
-                counts, seen_pairs = comparison_counts(excerpt_ids, comparisons)
-                scores = (
-                    fit_scores(excerpt_ids, comparisons)
-                    if comparisons
-                    else {e: 1.0 for e in excerpt_ids}
-                )
-                round_pairs = pick_pairs(
-                    excerpt_ids, scores, counts, seen_pairs, k=args.nbatch
-                )
+                counts = comparison_counts(excerpt_ids, comparisons)
+                round_pairs = pick_pairs(excerpt_ids, counts, args.nbatch)
                 if not round_pairs:
                     print("No further pairs available.")
                     break
@@ -445,11 +404,11 @@ def run_compare(args):
                     (b, a) if random.random() < 0.5 else (a, b) for a, b in round_pairs
                 ]  # avoid a systematic left/right or A/B bias
                 round_pairs = []
-                for (a, b), (result, reason, error) in zip(
+                for (a, b), (result, reason) in zip(
                     batch,
                     ask_llm_batch(batch, text_by_id, prompt, llm, sampling_params),
                 ):
-                    if error or result is None:
+                    if result is None:
                         consecutive_errors += 1
                         print(
                             f"[llm error, {consecutive_errors}/{args.max_errors}] {reason}"
@@ -494,7 +453,7 @@ def run_scores(args):
         print("No comparisons logged yet -- run the 'compare' command first.")
         return
 
-    counts, _ = comparison_counts(excerpt_ids, comparisons)
+    counts = comparison_counts(excerpt_ids, comparisons)
     print("Fitting scores...")
     excerpt_scores = fit_scores(excerpt_ids, comparisons)
     print("Done.")
@@ -528,16 +487,11 @@ def run_scores(args):
         "Score is average log-strength: 0 = about average, higher = more emotional."
     )
 
-    n_comps = {}
-    for c in comparisons:
-        n_comps[c["a"]] = n_comps.get(c["a"], 0) + 1
-        n_comps[c["b"]] = n_comps.get(c["b"], 0) + 1
-
     print(
-        f"\nExcerpt comparisons (min|median|max|total): {min(n_comps.values())} | {np.median(list(n_comps.values()))} | {max(n_comps.values())} | {len(comparisons)}/{len(excerpts)} (x{len(comparisons) / len(excerpts):.1f})"
+        f"\nExcerpt comparisons (min|median|max|total): {min(counts.values())} | {np.median(list(counts.values()))} | {max(counts.values())} | {len(comparisons)}/{len(excerpts)} (x{len(comparisons) / len(excerpts):.1f})"
     )
 
-    print(np.bincount(list(n_comps.values())))
+    print(np.bincount(list(counts.values())))
 
     print(
         f"\nScale separation reliability: {reliability(excerpt_ids, comparisons, pi=excerpt_scores):.2f} "
