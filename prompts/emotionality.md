@@ -20,8 +20,6 @@ If neither text is obviously more emotional, err on the side of a TIE.
 
 There may be many texts that a fairy straightforward in their reading and imply no strong emotional character. This is OK.
 
-Error is reserved for those situations where one or both of the input texts are garbage, missing, or in any other situation where you can't reasonably be expected to make a valid evaluation.
-
 ## Definition of emotionality
 
 We define the emotionality of text as one of two things:
@@ -60,7 +58,7 @@ Speakers, and especially politicians, can be deceptive in their language. They m
 <dd>"Internecine warfare" and "factional wars" are strong emotive words that, in this case, are not factual. There is not a real war amongst unions and this language is clearly an exaggeration and an appeal to emotion in the listener.
 
 <dt>The American Heart Association has just published their guidelines, which are consistent with the guidelines that the Pharmaceutical Benefits Advisory Committee has established, which says that existing disease should be treated aggressively.</dt>
-<dd>"Aggressively" in this case does not denote an emotional state either the speaker or an appeal to emotion in the listener. Cancer and other diseases are frequently denoted as "aggressive" and the use here, although speaking of treatment, seems in keeping with this usage.</dd>
+<dd>"Aggressively" in this case does not denote an emotional state either of the speaker or an appeal to emotion in the listener. Cancer and other diseases are frequently denoted as "aggressive" and the use here, although speaking of treatment, seems in keeping with this usage.</dd>
 
 <dt>The ex-ACTU president, the now member for Hotham, will be going to the ACTU congress and, presumably, when he gets there he will be telling the ACTU, `No, Australia is not a low- tax jurisdiction; it's a high-tax jurisdiction.' Presumably, when he gets there he will be saying, `Labor's policy is not to increase taxes but to cut them,' and, presumably, he will be naming those areas where Labor proposes to cut taxes. We await.</dt>
 <dd>The repeated use of "presumably..." and "we await" loads this text with an implicit hostility and degree of sarcasm that implies (at least somewhat) emotional state of the speaker. This is an example where this state is not explicitly stated but implied.</dd>
