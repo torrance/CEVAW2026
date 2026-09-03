@@ -39,9 +39,9 @@ import argparse
 import fcntl
 import json
 import math
+import pickle
 import random
 import re
-import pickle
 import textwrap
 import time
 from collections import Counter
@@ -50,7 +50,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from vllm import LLM
-
 
 SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 VIRTUAL_ANCHOR = "__anchor__"  # fixed reference point used to regularise the fit
@@ -245,7 +244,7 @@ def _bootstrap_replicate(excerpt_ids, comparisons, base_pi, rng):
     return np.log(list(pi_b.values()))
 
 
-def bootstrap_errors(excerpt_ids, comparisons, n_boot):
+def bootstrap_errors(excerpts, comparisons, n_boot):
     """
     Empirical per-item error via bootstrap, with replicates run concurrently.
     fit_scores is numpy-bound (bincount, elementwise array arithmetic), and
@@ -255,29 +254,34 @@ def bootstrap_errors(excerpt_ids, comparisons, n_boot):
     independent RNG stream (SeedSequence.spawn), since sharing one RNG
     object across threads is not safe to call concurrently.
     """
+    source_ids = {e["source_id"] for e in excerpts}
+    excerpt_ids = {e["excerpt_id"] for e in excerpts}
+
     rng = np.random.default_rng()
     m = len(comparisons)
     base_pi = np.array(
         list(fit_scores(excerpt_ids, comparisons).values())
     )  # warm-start reference
-    thetas = np.empty((n_boot, len(excerpt_ids)))
+
+
+    thetas = np.empty((n_boot, len(source_ids)))
     for b in range(n_boot):
         sample = [comparisons[i] for i in rng.integers(0, m, size=m)]
-        pi_b = list(
-            fit_scores(excerpt_ids, sample, warm_start=base_pi, tolerance=5e-2).values()
+        excerpt_scores = fit_scores(excerpt_ids, sample, warm_start=base_pi, tolerance=5e-2)
+        source_scores = aggregate_to_sources(excerpts, excerpt_scores)
+        thetas[b] = list(
+            source_scores.values()
         )
-        thetas[b] = np.log(pi_b)
 
-    return thetas.std(axis=0)
+    return dict(zip(source_ids, thetas.std(axis=0)))
 
 
-def bootstrap_summary(excerpt_ids, comparisons, n_boot=15):
-    errors = bootstrap_errors(excerpt_ids, comparisons, n_boot)
+def bootstrap_summary(errors):
+    errors = list(errors.values())
     return {
         "median_error": float(np.median(errors)),
         "p90_error": float(np.percentile(errors, 90)),
         "p95_error": float(np.percentile(errors, 95)),
-        "per_item": dict(zip(excerpt_ids, errors)),
     }
 
 
@@ -461,10 +465,6 @@ def run_scores(args):
     print("Done.")
     source_scores = aggregate_to_sources(excerpts, excerpt_scores)
 
-    filename = Path(args.corpus).with_suffix("").with_suffix(".scores.pkl")
-    with open(filename, "wb") as f:
-        pickle.dump(source_scores, f)
-
     n_excerpts = {}
     for e in excerpts:
         n_excerpts[e["source_id"]] = n_excerpts.get(e["source_id"], 0) + 1
@@ -490,21 +490,34 @@ def run_scores(args):
     )
 
     print(
-        f"\nExcerpt comparisons (min|median|max|total): {min(counts.values())} | {np.median(list(counts.values()))} | {max(counts.values())} | {len(comparisons)}/{len(excerpts)} (x{len(comparisons) / len(excerpts):.1f})"
+        f"\nExcerpt comparisons (min|median|max|total): {min(counts.values())} | {np.median(list(counts.values()))} | {max(counts.values())} | {2 * len(comparisons)}/{len(excerpts)} (x{2 * len(comparisons) / len(excerpts):.1f})"
     )
 
-    print(np.bincount(list(counts.values())))
+    print({
+        key: int(value) for key, value in
+        enumerate(
+            np.bincount(list(counts.values()))
+        )
+    })
 
     print(
         f"\nScale separation reliability: {reliability(excerpt_ids, comparisons, pi=excerpt_scores):.2f} "
         "(rule of thumb: >0.7 reliable, >0.9 diminishing returns)"
     )
 
-    summary = bootstrap_summary(excerpt_ids, comparisons, n_boot=15)
+    errors = bootstrap_errors(excerpts, comparisons, n_boot=25)
+    summary = bootstrap_summary(errors)
     print(
         f"95% of items have error below {summary['p95_error']:.2f} (log-strength units); "
         f"median error {summary['median_error']:.2f}"
     )
+
+    source_scores = {sid: (score, errors[sid]) for sid, score in source_scores.items()}
+    print(source_scores)
+
+    filename = Path(args.corpus).with_suffix("").with_suffix(".scores.pkl")
+    with open(filename, "wb") as f:
+        pickle.dump(source_scores, f)
 
 
 def run_reset(args):
