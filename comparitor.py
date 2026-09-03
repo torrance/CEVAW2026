@@ -294,10 +294,12 @@ def pick_pairs(excerpt_ids, counts, k):
     count = np.array([counts.get(e, 0) for e in excerpt_ids])
 
     # Efraimidis-Spirakis weighted sampling without replacement: orders
-    # excerpts favoring low comparison counts
-    weight = 1.0 / (count + 1) ** 4
-    keys = np.random.random(len(count)) ** (1.0 / weight)
-    top = np.argsort(-keys)[: 2 * k]
+    # excerpts favoring low comparison counts. Computed in log-space to
+    # avoid underflows to bit-exact 0.0. In linear space, this would be:
+    # np.random.random(len(count)) ** weight
+    weight = (count + 1) ** 2
+    log_keys = np.log(np.random.random(len(count))) * weight
+    top = np.argsort(-log_keys)[: 2 * k]
 
     np.random.shuffle(top)
     return [
